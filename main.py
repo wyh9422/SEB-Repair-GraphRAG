@@ -10,13 +10,11 @@ from src.SRgraphrag.utils.misc_utils import string_to_bool
 from src.SRgraphrag.utils.config_utils import BaseConfig
 
 # os.environ["LOG_LEVEL"] = "DEBUG"
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-os.environ["HF_HOME"] = "/root/autodl-tmp/hf_cache"
-os.environ["HF_HUB_DISABLE_XET"] = "1"
-
-os.environ["OPENAI_API_KEY"] = "sk-c033b4013f704ca389a0c832c7632fef"
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+# os.environ["HF_HOME"] = "/root/autodl-tmp/hf_cache"
+# os.environ["HF_HUB_DISABLE_XET"] = "1"
 # os.environ["DEEPSEEK_API_KEY"] = "YOUR_KEY"
 
 # -------------------------
@@ -326,9 +324,9 @@ def main():
 if __name__ == "__main__":
     main()
 
-# 示例：
-# 仅检索：
+# example：
+# Retrieval Only：
 # python main.py --dataset musique --mode retrieve --llm_base_url https://api.deepseek.com/v1 --llm_name deepseek-chat --judge_llm_name deepseek-reasoner --save_dir outputs --result_save_root result_outputs
 #
-# 检索+问答：
+# Retrieval + QA：
 # python main.py --dataset hotpotqa --mode qa --llm_base_url https://api.deepseek.com/v1 --llm_name deepseek-chat --judge_llm_name deepseek-reasoner --save_dir outputs
