@@ -13,14 +13,22 @@ logger = get_logger(__name__)
 
 
 def _get_llm_class(config: BaseConfig):
-    if config.llm_base_url is not None and 'localhost' in config.llm_base_url and os.getenv('OPENAI_API_KEY') is None:
+    # DeepSeek → OpenAI
+    if os.getenv("OPENAI_API_KEY") is None:
+        deepseek_key = os.getenv("DEEPSEEK_API_KEY")
+        if deepseek_key is not None:
+            os.environ["OPENAI_API_KEY"] = deepseek_key
+
+    if config.llm_base_url is not None and \
+       'localhost' in config.llm_base_url and \
+       os.getenv('OPENAI_API_KEY') is None:
         os.environ['OPENAI_API_KEY'] = 'sk-'
 
     if config.llm_name.startswith('bedrock'):
         return BedrockLLM(config)
-    
+
     if config.llm_name.startswith('Transformers/'):
         return TransformersLLM(config)
-    
+
     return CacheOpenAI.from_experiment_config(config)
     
