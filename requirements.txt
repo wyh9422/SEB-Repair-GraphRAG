@@ -1,0 +1,17 @@
+openai
+litellm
+vllm==0.6.6.post1
+gritlm
+torch
+transformers==4.45.2
+networkx
+pydantic
+python_igraph
+tenacity
+tiktoken
+nest_asyncio
+numpy
+scipy
+tqdm
+einops
+boto3
