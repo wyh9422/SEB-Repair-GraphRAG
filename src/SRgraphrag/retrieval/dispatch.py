@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import os
 
 from .ppr import PPRGraphSearch
@@ -14,7 +15,7 @@ def dense_result(owner, request, reason=None):
     ids = list(ids[:request.retrieval_limit])
     return GraphSearchResult(
         ranked_passage_ids=[owner.passage_node_keys[int(i)] for i in ids],
-        scores=[float(s) for s in scores[:len(ids)]],
+        scores=[float(s) if s is not None and math.isfinite(float(s)) else None for s in scores[:len(ids)]],
         score_sources=["dpr"] * len(ids), stop_reason="dpr_fallback",
         fallback_reason=reason,
     )

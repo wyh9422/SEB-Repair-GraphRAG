@@ -127,3 +127,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
         owner.graph.es[0]["weight"] = float("nan")
         result = owner.retrieve_full_once("q", num_to_retrieve=5)
         self.assertEqual(result["graph_search"]["fallback_reason"], "invalid_graph_weights")
+
+    def test_nonfinite_dense_fallback_scores_still_serialize_as_null(self):
+        owner = self.make_owner()
+        owner.dense_passage_retrieval = lambda query: (self.np.array([0, 1]), self.np.array([float("nan"), 0.2]))
+        result = owner.retrieve_full_once("q", num_to_retrieve=5)
+        self.assertEqual(result["graph_search"]["fallback_reason"], "nonfinite_dense_scores")
+        self.assertIsNone(result["graph_search"]["scores"][0])
+        json.dumps(result, allow_nan=False)
