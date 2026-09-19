@@ -1,0 +1,3 @@
+# Optional Transformers/* SentenceTransformer embedding backend.
+-r requirements.txt
+sentence-transformers

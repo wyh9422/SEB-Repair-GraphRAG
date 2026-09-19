@@ -1,7 +1,7 @@
 openai
 litellm
-vllm==0.6.6.post1
-gritlm
+# Optional local backends: requirements-vllm.txt, requirements-gritlm.txt,
+# and requirements-sentence-transformers.txt.
 torch
 transformers==4.45.2
 networkx
@@ -15,3 +15,11 @@ scipy
 tqdm
 einops
 boto3
+aiohttp
+filelock
+httpx
+packaging
+pandas
+pyarrow
+requests
+accelerate

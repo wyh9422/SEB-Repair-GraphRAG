@@ -1,0 +1,3 @@
+# Optional offline OpenIE backend; retains the existing tested version pin.
+-r requirements.txt
+vllm==0.6.6.post1
