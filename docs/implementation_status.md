@@ -2,6 +2,8 @@
 
 日期：2026-09-19。开发起点：`dev` 的 `6fa8e2c`。原方案见 [P0—P4 计划](agent_graph_retrieval_plan.md)，当前模块说明见 [代码概览](codebase_overview.md)。本文不保存 SSH/API 凭据。
 
+后续真实数据测试发现并修复动作封装问题；按用户要求默认关闭累计 Token 截断，保留次数/时间与证据校验。最新状态为 137 项服务器测试通过、冻结的 13 条 Agent 请求中 10 条成功提交路径，详见 [动作协议修复与复测报告](agent_action_format_fix.md)。下文保留最初实现时的验证历史；历史临时验证目录已归档至 `/root/autodl-tmp/seb-test-archive.nrfaeC/previous-validation.tar.gz`。
+
 ## 已实现范围
 
 | 阶段 | 当前交付 |
