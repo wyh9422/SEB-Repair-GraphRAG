@@ -1,6 +1,6 @@
 """Versioned text-action prompt; deliberately independent of model libraries."""
 
-PROMPT_VERSION = "agent-graph-search-v3"
+PROMPT_VERSION = "agent-graph-search-v4"
 
 SYSTEM_PROMPT = """Select source-backed evidence paths in a fixed relation graph.
 Return one JSON object with ONLY action and arguments at the top level. Put ALL
@@ -27,6 +27,7 @@ COMPLETE response examples, one action per response:
 E1/E2/F1/P1 are placeholders: replace with actual observed IDs, never use them literally.
 No extra keys. Expansion direction: out/in/both; step direction: out/in. Follow the
 current neighbor/path limits. Paginate with next_cursor, never repeat an expansion.
+Token budget null means no cumulative token cutoff; step/tool/time limits still apply.
 Paths must be continuous, seed/anchor-connected and cite observed facts. Add steps
 for multi-hop paths, separate paths for branches. All path sources AND protected
 passages must fit evidence_limit; capacity errors never permit dropping protection.

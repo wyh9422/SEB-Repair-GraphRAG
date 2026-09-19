@@ -141,11 +141,15 @@ python main.py --dataset 2wikimultihopqa --mode retrieve \
   --graph_search_mode agent --agent_apply_to round2 --agent_fallback ppr \
   --agent_max_steps 8 --agent_max_tool_calls 16 --agent_max_expansions 64 \
   --agent_max_neighbors 8 --agent_max_path_length 4 \
-  --agent_max_tokens 12000 --agent_max_seconds 60 \
+  --agent_max_tokens none --agent_max_seconds 60 \
   --result_save_root result_outputs/agent_trial --test_n 20
 ```
 
 Tools enforce observed IDs, direction, continuity, provenance and evidence capacity. Committed path sources and protected first-round evidence must fit together in Top-5. Unknown scores serialize as `null`. Fallback choices are `ppr` (default), `dpr`, and `none`; `none` retains the first round when no path is committed. The MVP's live Agent adapter supports OpenAI-compatible text backends.
+
+Agent actions use the strict envelope `{"action":"expand_entity","arguments":{"entity_id":"<observed ID>"}}`. Malformed envelopes receive explicit correction feedback; they are never silently executed. A successful expansion only exposes evidence: `commit_paths` must select valid, source-backed paths before they become the Agent retrieval result.
+
+The cumulative token cutoff is disabled by default (`--agent_max_tokens none`). Steps, tool calls, expanded edges, retries, path length and wall-clock timeout still bound the run. Token usage is recorded for cost analysis; the per-response JSON output cap remains 1,024 tokens. To opt into the former cumulative cutoff, pass `--agent_max_tokens 12000`; its preflight estimate conservatively counts UTF-8 bytes, so it may stop before 12,000 actual tokens are consumed. Disabling the cutoff can increase API cost, and does not remove the provider's context/output limits.
 
 For paired experiments, save a PPR two-round run, then use its `retrieval_trace.jsonl` with `--round1_replay_path PATH` for Agent and Hybrid. Use separate result roots to avoid overwriting trials. Replay fixes first-round evidence and judge outputs; gold evidence is never passed to the Agent.
 

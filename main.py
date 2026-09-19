@@ -310,6 +310,12 @@ def _nonnegative_int(value: str) -> int:
     return number
 
 
+def _optional_token_limit(value: str) -> Optional[int]:
+    if value.lower() == "none":
+        return None
+    return _positive_int(value)
+
+
 def _positive_float(value: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number <= 0:
@@ -351,7 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent_max_expansions", type=_positive_int, default=64)
     parser.add_argument("--agent_max_path_length", type=_positive_int, default=4)
     parser.add_argument("--agent_max_neighbors", type=_positive_int, default=8)
-    parser.add_argument("--agent_max_tokens", type=_positive_int, default=12000)
+    parser.add_argument("--agent_max_tokens", type=_optional_token_limit, default=None,
+                        help="Optional cumulative token limit; default none uses step/tool/time limits only")
     parser.add_argument("--agent_max_seconds", type=_positive_float, default=60.0)
     return parser
 

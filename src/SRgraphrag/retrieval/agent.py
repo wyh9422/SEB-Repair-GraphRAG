@@ -167,7 +167,8 @@ class AgentGraphSearch:
                 return self._finish("time_budget", trace, usage, started, tools)
             if usage["retries"] > budget.max_retries:
                 return self._finish(last_failure or "retry_budget", trace, usage, started, tools)
-            remaining_tokens = budget.max_tokens - usage["budget_tokens"]
+            remaining_tokens = (None if budget.max_tokens is None
+                                else budget.max_tokens - usage["budget_tokens"])
             if tools.usage.get("remaining_calls", 1) == 0:
                 return self._finish("tool_budget", trace, usage, started, tools)
             state = {
@@ -194,7 +195,7 @@ class AgentGraphSearch:
             # the supported byte-tokenized models without a tokenizer dependency.
             # Count the full state (including frontier IDs), not just history.
             prompt_estimate = sum(len(message["content"].encode("utf-8")) + 16 for message in call_messages) + 256
-            if remaining_tokens <= prompt_estimate:
+            if remaining_tokens is not None and remaining_tokens <= prompt_estimate:
                 return self._finish("token_budget", trace, usage, started, tools, budget_check={
                     "stage": "before_llm", "limit_tokens": budget.max_tokens,
                     "used_budget_tokens": usage["budget_tokens"],
@@ -202,7 +203,8 @@ class AgentGraphSearch:
                     "next_prompt_estimate": prompt_estimate,
                     "estimator": "utf8_bytes_with_framing_upper_bound",
                 })
-            state["llm_limits"]["max_completion_tokens"] = min(1024, remaining_tokens - prompt_estimate)
+            if remaining_tokens is not None:
+                state["llm_limits"]["max_completion_tokens"] = min(1024, remaining_tokens - prompt_estimate)
             call_messages[-1] = {"role": "user", "content": _json(state)}
             usage["llm_calls"] += 1
             try:
@@ -242,7 +244,7 @@ class AgentGraphSearch:
                           "cache_hit": bool(cache_hit), "budget_tokens": usage["budget_tokens"]})
             if time.monotonic() - started >= budget.max_seconds:
                 return self._finish("time_budget", trace, usage, started, tools)
-            if usage["budget_tokens"] > budget.max_tokens:
+            if budget.max_tokens is not None and usage["budget_tokens"] > budget.max_tokens:
                 return self._finish("token_budget", trace, usage, started, tools)
             try:
                 command = parse_action(response, budget)

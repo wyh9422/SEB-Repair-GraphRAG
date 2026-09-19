@@ -65,9 +65,15 @@ runpy.run_path('main.py', run_name='__main__')
             "max_expansions": 64,
             "max_path_length": 4,
             "max_neighbors": 8,
-            "max_tokens": 12000,
+            "max_tokens": None,
             "max_seconds": 60.0,
         })
+
+    def test_cumulative_token_limit_can_be_explicitly_disabled_or_enabled(self):
+        for value, expected in (("none", None), ("NONE", None), ("12000", 12000)):
+            with self.subTest(value=value):
+                args = main.build_parser().parse_args(["--agent_max_tokens", value])
+                self.assertEqual(main.agent_budget_from_args(args)["max_tokens"], expected)
 
     def test_zero_queries_does_not_initialize_models(self):
         result = subprocess.run(
@@ -80,6 +86,8 @@ runpy.run_path('main.py', run_name='__main__')
         for arguments in (
             ["--agent_max_steps", "0"],
             ["--agent_max_tokens", "-1"],
+            ["--agent_max_tokens", "0"],
+            ["--agent_max_tokens", "nan"],
             ["--agent_max_seconds", "nan"],
             ["--agent_max_seconds", "inf"],
             ["--agent_apply_to", "round1"],

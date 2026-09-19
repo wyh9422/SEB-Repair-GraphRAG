@@ -107,14 +107,15 @@ class ActionSchemaTests(unittest.TestCase):
         for values in ({"max_steps": True}, {"max_seconds": float("nan")},
                        {"max_seconds": float("inf")}, {"max_tokens": -1},
                        {"max_neighbors": 0}, {"max_path_length": 0},
-                       {"max_tokens": 1.5}, {"unbounded": True}):
+                       {"max_tokens": 1.5}, {"max_tokens": True}, {"max_tokens": "none"},
+                       {"max_steps": None}, {"max_seconds": None}, {"unbounded": True}):
             with self.subTest(values=values), self.assertRaises(ActionError):
                 AgentBudget.from_values(values)
 
     def test_budget_merge_and_zero_steps(self):
         budget = AgentBudget.from_values({"max_steps": 4}, {"max_steps": 0})
         self.assertEqual(budget.max_steps, 0)
-        self.assertEqual(budget.max_tokens, 12000)
+        self.assertIsNone(budget.max_tokens)
 
 
 class AgentRetrievalTests(unittest.TestCase):
@@ -336,9 +337,49 @@ class AgentRetrievalTests(unittest.TestCase):
     def test_token_overrun_rejects_action_before_tools(self):
         def llm(_messages):
             return self.success_actions()[0], {"prompt_tokens": 13000, "completion_tokens": 1}, False
-        result = AgentGraphSearch(self.index, llm).search(self.request())
+        result = AgentGraphSearch(self.index, llm).search(self.request(budget={"max_tokens": 12000}))
         self.assertEqual(result.stop_reason, "token_budget")
         self.assertEqual(result.usage["tool_calls"], 0)
+
+    def test_disabled_token_limit_allows_commit_and_still_records_usage(self):
+        outputs = iter(self.success_actions())
+        calls = []
+        def llm(messages):
+            calls.append(copy.deepcopy(messages))
+            return next(outputs), {"prompt_tokens": 13000, "completion_tokens": 100}, False
+        request = self.request(budget={"max_tokens": None})
+        result = AgentGraphSearch(self.index, llm).search(request)
+        self.assertEqual(result.stop_reason, "committed")
+        self.assertEqual(result.usage["total_tokens"], 39300)
+        self.assertEqual(result.usage["budget_tokens"], 39300)
+        self.assertEqual(result.usage["tool_calls"], 3)
+        for messages in calls:
+            state = json.loads(messages[-1]["content"])
+            self.assertIsNone(state["remaining_budget"]["tokens"])
+            self.assertEqual(state["llm_limits"]["max_completion_tokens"], 1024)
+        replay = AgentGraphSearch(self.index, None).replay(request, result.trace)
+        self.assertEqual(replay.selected_paths, result.selected_paths)
+
+    def test_disabled_token_limit_does_not_disable_step_tool_or_retry_limits(self):
+        for limits, outputs, reason in (
+            ({"max_steps": 1}, self.success_actions(), "step_budget"),
+            ({"max_tool_calls": 1}, self.success_actions(), "tool_budget"),
+            ({"max_retries": 0}, ["invalid JSON"], "invalid_action"),
+        ):
+            with self.subTest(limits=limits):
+                result = AgentGraphSearch(self.index, ScriptedLLM(outputs)).search(
+                    self.request(budget={"max_tokens": None, **limits}))
+                self.assertEqual(result.stop_reason, reason)
+                self.assertEqual(result.selected_paths, [])
+
+    def test_disabled_token_limit_accepts_long_prompt_and_counts_estimated_usage(self):
+        llm = ScriptedLLM([action("stop", reason="No supported path")], metadata=False)
+        request = self.request(original_query="long query " * 2000, budget={"max_tokens": None})
+        result = AgentGraphSearch(self.index, llm).search(request)
+        self.assertEqual(result.stop_reason, "agent_stop")
+        self.assertEqual(len(llm.calls), 1)
+        self.assertGreater(result.usage["estimated_tokens"], 12000)
+        self.assertEqual(result.usage["total_tokens"], 0)
 
     def test_preflight_budget_records_estimate_without_relaxing_limit(self):
         llm = ScriptedLLM([])

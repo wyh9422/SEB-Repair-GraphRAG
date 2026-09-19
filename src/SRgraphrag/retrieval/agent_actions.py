@@ -28,7 +28,9 @@ class AgentBudget:
     max_expansions: int = 64
     max_path_length: int = 4
     max_neighbors: int = 8
-    max_tokens: int = 12000
+    # None disables only the cumulative token cutoff. Steps/tools/time and the
+    # per-response output cap remain bounded; token usage is still recorded.
+    max_tokens: int | None = None
     max_seconds: float = 60.0
     max_retries: int = 2
 
@@ -42,6 +44,8 @@ class AgentBudget:
                 raise ActionError("Unknown budget fields or non-object budget")
             values.update(override)
         for name, value in values.items():
+            if name == "max_tokens" and value is None:
+                continue
             if name == "max_seconds":
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                     raise ActionError("max_seconds must be finite and non-negative")
