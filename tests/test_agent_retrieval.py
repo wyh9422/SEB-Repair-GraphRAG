@@ -52,9 +52,12 @@ class ActionSchemaTests(unittest.TestCase):
         examples = [line for line in SYSTEM_PROMPT.splitlines() if line.startswith('{"action":')]
         self.assertEqual(len(examples), 6)
         parsed = [parse_action(example, AgentBudget()) for example in examples]
+        self.assertEqual(parsed[0]["action"], "expand_entity")
         self.assertEqual({command["action"] for command in parsed}, {
             "plan", "expand_entity", "inspect_passage", "validate_path", "commit_paths", "stop"})
         self.assertNotEqual(PROMPT_VERSION, "agent-graph-search-v1")
+        self.assertIn("start with expand_entity or inspect_passage", SYSTEM_PROMPT)
+        self.assertLess(len(SYSTEM_PROMPT.encode()), 2400)
 
     def test_flat_or_mixed_envelopes_are_rejected_with_specific_correction(self):
         for command in (
