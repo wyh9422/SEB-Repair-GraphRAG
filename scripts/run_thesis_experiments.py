@@ -328,6 +328,13 @@ def worker(args):
         if (qdir / "input.json").exists() and read(qdir / "input.json") != identity:
             raise RuntimeError("Checkpoint identity does not match the current dataset")
         save(qdir / "input.json", identity)
+        if args.dev_replay_root and not (qdir / "round1.json").exists():
+            from main import load_round1_replay
+            historical = load_round1_replay(str(args.dev_replay_root / dataset / "ITER_cap4_agent/retrieval_trace.jsonl"))[source_index]
+            if historical["query"] != query:
+                raise RuntimeError("Development replay question order differs")
+            save(qdir / "round1.json", {"result": historical["round1"], "seconds": None, "events": [], "historical_replay": True})
+            save(qdir / "judge.json", {"result": historical["judge1"], "seconds": None, "historical_replay": True})
         variants = list(CORE) + (list(EXTRAS) if source_index < args.start + args.extra_n else [])
         if all((qdir / "results" / f"{variant}.json").exists() for variant in variants):
             continue
@@ -499,6 +506,7 @@ def manifest(args):
     source_files = sorted((ROOT / "src/SRgraphrag").rglob("*.py")) + [Path(__file__), ROOT / "main.py"]
     source_files += sorted((ROOT / "src/SRgraphrag/prompts").rglob("*.json"))
     return {"schema": SCHEMA, "start": args.start, "stop": args.stop, "extra_n": args.extra_n,
+            "dev_replay_root": str(args.dev_replay_root) if args.dev_replay_root else None,
             "datasets": args.datasets, "core": list(CORE), "extras": list(EXTRAS), "budget": BUDGET,
             "readme": "Indices [0,20) are development; [20,1000) is the main fixed set. No gold enters online retrieval.",
             "sources": {str(path.relative_to(ROOT)): fingerprint(path) for path in source_files},
@@ -530,6 +538,8 @@ def supervise(args):
             command = [sys.executable, "-u", str(Path(__file__).resolve()), "--run-dir", str(args.run_dir),
                        "--worker", dataset, "--live", "--start", str(args.start), "--stop", str(args.stop),
                        "--extra-n", str(args.extra_n)]
+            if args.dev_replay_root:
+                command += ["--dev-replay-root", str(args.dev_replay_root)]
             with (args.run_dir / f"{dataset}.log").open("a") as log, (args.run_dir / "resources.jsonl").open("a") as resource_log:
                 child = subprocess.Popen(command, cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
                 item["pid"] = child.pid
@@ -562,6 +572,7 @@ def parser():
     result.add_argument("--live", action="store_true")
     result.add_argument("--resume", action="store_true")
     result.add_argument("--worker", choices=("musique", "2wikimultihopqa", "hotpotqa"))
+    result.add_argument("--dev-replay-root", type=Path, help="Historical frozen smoke traces, development indices only")
     return result
 
 
@@ -569,6 +580,10 @@ def main():
     args = parser().parse_args()
     if not 0 <= args.start < args.stop <= 1000 or args.extra_n < 0:
         raise SystemExit("Require 0 <= start < stop <= 1000 and extra-n >= 0")
+    if args.dev_replay_root and args.stop > 20:
+        raise SystemExit("Historical smoke replay is restricted to development indices below 20")
+    if args.dev_replay_root:
+        args.dev_replay_root = args.dev_replay_root.resolve()
     args.run_dir = args.run_dir.resolve()
     os.chdir(ROOT)
     if not args.live:
