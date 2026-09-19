@@ -16,6 +16,7 @@ from SRgraphrag.graph.schema import entity_id, fact_id, passage_id
 from SRgraphrag.retrieval.agent import AgentGraphSearch
 from SRgraphrag.retrieval.agent_actions import ActionError, AgentBudget, parse_action
 from SRgraphrag.retrieval.types import GraphSearchRequest
+from SRgraphrag.prompts.templates.agent_graph_search import PROMPT_VERSION, SYSTEM_PROMPT
 
 
 def action(name, **arguments):
@@ -47,6 +48,37 @@ class ScriptedLLM:
 
 
 class ActionSchemaTests(unittest.TestCase):
+    def test_every_prompt_example_is_a_complete_valid_action(self):
+        examples = [line for line in SYSTEM_PROMPT.splitlines() if line.startswith('{"action":')]
+        self.assertEqual(len(examples), 6)
+        parsed = [parse_action(example, AgentBudget()) for example in examples]
+        self.assertEqual({command["action"] for command in parsed}, {
+            "plan", "expand_entity", "inspect_passage", "validate_path", "commit_paths", "stop"})
+        self.assertNotEqual(PROMPT_VERSION, "agent-graph-search-v1")
+
+    def test_flat_or_mixed_envelopes_are_rejected_with_specific_correction(self):
+        for command in (
+            {"action": "plan", "goal": "Find source-backed evidence"},
+            {"action": "expand_entity", "entity_id": "observed-id", "direction": "both", "limit": 8},
+            {"action": "expand_entity", "arguments": {"entity_id": "observed-id"}, "limit": 8},
+            {"action": "stop"},
+        ):
+            with self.subTest(command=command), self.assertRaises(ActionError) as caught:
+                parse_action(json.dumps(command), AgentBudget())
+            message = str(caught.exception)
+            self.assertIn('exactly "action" and "arguments"', message)
+            self.assertIn('inside the "arguments" object', message)
+            self.assertIn('{"action":"expand_entity","arguments":', message)
+
+    def test_field_feedback_is_specific_and_does_not_echo_untrusted_fields(self):
+        invalid = [action("expand_entity"), action("expand_entity", entity_id="x", **{"PRIVATE-untrusted-key": "PRIVATE-value"}),
+                   '{"action":"expand_entity","arguments":[]}']
+        for response in invalid:
+            with self.subTest(response=response), self.assertRaises(ActionError) as caught:
+                parse_action(response, AgentBudget())
+            self.assertIn("Required fields: entity_id", str(caught.exception))
+            self.assertNotIn("PRIVATE", str(caught.exception))
+
     def test_strict_json_shapes_and_unknown_fields(self):
         invalid = ["[]", "null", "42", "```json\n{}\n```", "{}",
                    '{"action":"stop","action":"plan","arguments":{}}',
@@ -184,6 +216,34 @@ class AgentRetrievalTests(unittest.TestCase):
         self.assertEqual(result.usage["retries"], 1)
         self.assertEqual(result.usage["llm_calls"], 4)
 
+    def test_missing_arguments_feedback_allows_model_correction_and_replay(self):
+        # Reproduce the real provider's flat response, then require useful error
+        # feedback before the scripted model supplies its corrected envelope.
+        flat = json.dumps({"action": "expand_entity", "entity_id": entity_id("Ada")})
+        llm = ScriptedLLM([flat] + self.success_actions())
+        request = self.request()
+        result = AgentGraphSearch(self.index, llm).search(request)
+        feedback = json.loads(llm.calls[1][-2]["content"])
+        self.assertEqual(feedback["error"]["code"], "invalid_action")
+        self.assertIn('inside the "arguments" object', feedback["error"]["message"])
+        self.assertEqual(result.stop_reason, "committed")
+        self.assertEqual(result.usage["invalid_actions"], 1)
+        self.assertEqual(result.usage["retries"], 1)
+        self.assertEqual(result.usage["llm_calls"], 4)
+        self.assertEqual(result.usage["tool_calls"], 3)
+        self.assertEqual(result.trace[1]["response"], flat)
+        replayed = AgentGraphSearch(self.index, None).replay(request, result.trace)
+        self.assertEqual(replayed.selected_paths, result.selected_paths)
+
+    def test_flat_response_is_not_silently_executed_or_given_unlimited_retries(self):
+        flat = json.dumps({"action": "expand_entity", "entity_id": entity_id("Ada")})
+        result = AgentGraphSearch(self.index, ScriptedLLM([flat])).search(
+            self.request(budget={"max_retries": 0}))
+        self.assertEqual(result.stop_reason, "invalid_action")
+        self.assertEqual(result.usage["llm_calls"], 1)
+        self.assertEqual(result.usage["tool_calls"], 0)
+        self.assertEqual(result.selected_paths, [])
+
     def test_illegal_action_never_executes_model_code(self):
         llm = ScriptedLLM([action("python", code="raise Exception()")])
         result = AgentGraphSearch(self.index, llm).search(self.request(budget={"max_retries": 0}))
@@ -276,6 +336,19 @@ class AgentRetrievalTests(unittest.TestCase):
         result = AgentGraphSearch(self.index, llm).search(self.request())
         self.assertEqual(result.stop_reason, "token_budget")
         self.assertEqual(result.usage["tool_calls"], 0)
+
+    def test_preflight_budget_records_estimate_without_relaxing_limit(self):
+        llm = ScriptedLLM([])
+        result = AgentGraphSearch(self.index, llm).search(self.request(budget={"max_tokens": 100}))
+        self.assertEqual(result.stop_reason, "token_budget")
+        check = result.trace[-1]["budget_check"]
+        self.assertEqual(check["stage"], "before_llm")
+        self.assertEqual(check["limit_tokens"], 100)
+        self.assertEqual(check["used_budget_tokens"], 0)
+        self.assertEqual(check["remaining_tokens"], 100)
+        self.assertGreater(check["next_prompt_estimate"], check["remaining_tokens"])
+        self.assertEqual(result.usage["total_tokens"], 0)
+        self.assertEqual(llm.calls, [])
 
     def test_time_overrun_rejects_action_before_tools(self):
         elapsed = [0.0]

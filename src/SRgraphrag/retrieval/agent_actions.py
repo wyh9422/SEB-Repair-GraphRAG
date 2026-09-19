@@ -9,6 +9,13 @@ import math
 
 ACTION_SCHEMA_VERSION = "graph-actions-v1"
 
+ACTION_ENVELOPE_HELP = (
+    'Return one JSON object with exactly "action" and "arguments". '
+    'Put every action parameter inside the "arguments" object, not at the top level. '
+    'Example: {"action":"expand_entity","arguments":{"entity_id":"OBSERVED_ENTITY_ID"}}. '
+    'Replace the placeholder with an entity ID already observed in this task.'
+)
+
 
 class ActionError(ValueError):
     """A model action or budget does not match the public protocol."""
@@ -58,8 +65,17 @@ def _unique_object(pairs):
 
 
 def _keys(value, required, optional=()):
-    if not isinstance(value, dict) or not set(required) <= set(value) or set(value) - set(required) - set(optional):
-        raise ActionError("Incorrect action argument fields")
+    # Name only schema-owned fields, never echo arbitrary model-supplied keys or
+    # values into the correction instruction. Validation remains fail-closed.
+    expected = "Required fields: " + ", ".join(required or ("none",))
+    expected += "; optional fields: " + ", ".join(optional or ("none",)) + "."
+    if not isinstance(value, dict):
+        raise ActionError("Action arguments (or path step) must be a JSON object. " + expected)
+    missing = set(required) - set(value)
+    if missing:
+        raise ActionError("Missing required fields: " + ", ".join(sorted(missing)) + ". " + expected)
+    if set(value) - set(required) - set(optional):
+        raise ActionError("Unexpected fields are not allowed. " + expected)
 
 
 def _text(value, name, maximum=256, allow_empty=False):
@@ -91,8 +107,9 @@ def parse_action(response, budget):
         command = json.loads(response, object_pairs_hook=_unique_object,
                              parse_constant=lambda value: (_ for _ in ()).throw(ActionError("Non-finite JSON number")))
     except (ValueError, TypeError, RecursionError) as exc:
-        raise ActionError("Response is not a valid JSON action") from exc
-    _keys(command, ("action", "arguments"))
+        raise ActionError("Response is not a valid JSON action. " + ACTION_ENVELOPE_HELP) from exc
+    if not isinstance(command, dict) or set(command) != {"action", "arguments"}:
+        raise ActionError("Invalid action envelope. " + ACTION_ENVELOPE_HELP)
     action, args = command["action"], command["arguments"]
     _text(action, "action", 64)
     if action == "plan":

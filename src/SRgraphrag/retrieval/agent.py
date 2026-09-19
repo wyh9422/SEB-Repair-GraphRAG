@@ -117,7 +117,7 @@ class AgentGraphSearch:
         }
 
     @staticmethod
-    def _finish(reason, trace, usage, started, tools=None, committed=None):
+    def _finish(reason, trace, usage, started, tools=None, committed=None, budget_check=None):
         usage = dict(usage)
         if tools is not None:
             usage.update(tools.usage)
@@ -126,6 +126,8 @@ class AgentGraphSearch:
         passages = committed.get("passage_ids", []) if committed else []
         trace.append({"event": "stop", "stop_reason": reason,
                       "selected_paths": paths, "passage_ids": passages})
+        if budget_check is not None:
+            trace[-1]["budget_check"] = budget_check
         return GraphSearchResult(
             ranked_passage_ids=passages,
             scores=[None] * len(passages),
@@ -193,7 +195,13 @@ class AgentGraphSearch:
             # Count the full state (including frontier IDs), not just history.
             prompt_estimate = sum(len(message["content"].encode("utf-8")) + 16 for message in call_messages) + 256
             if remaining_tokens <= prompt_estimate:
-                return self._finish("token_budget", trace, usage, started, tools)
+                return self._finish("token_budget", trace, usage, started, tools, budget_check={
+                    "stage": "before_llm", "limit_tokens": budget.max_tokens,
+                    "used_budget_tokens": usage["budget_tokens"],
+                    "remaining_tokens": remaining_tokens,
+                    "next_prompt_estimate": prompt_estimate,
+                    "estimator": "utf8_bytes_with_framing_upper_bound",
+                })
             state["llm_limits"]["max_completion_tokens"] = min(1024, remaining_tokens - prompt_estimate)
             call_messages[-1] = {"role": "user", "content": _json(state)}
             usage["llm_calls"] += 1

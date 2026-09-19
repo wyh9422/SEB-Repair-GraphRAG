@@ -45,3 +45,17 @@ class AdapterTests(unittest.TestCase):
     def test_unsupported_backend_is_explicit(self):
         with self.assertRaises(ValueError):
             AgentLLMAdapter(object(), "unused.sqlite")([])
+
+    def test_prompt_change_does_not_reuse_old_response_cache(self):
+        from src.SRgraphrag.prompts.templates.agent_graph_search import SYSTEM_PROMPT
+        client = Client()
+        llm = SimpleNamespace(openai_client=client, llm_config=SimpleNamespace(generate_params={"model": "deepseek-chat"}))
+        state = {"llm_limits": {"timeout_seconds": 30, "max_completion_tokens": 100}}
+        with TemporaryDirectory() as directory:
+            adapter = AgentLLMAdapter(llm, Path(directory) / "cache.sqlite")
+            def messages(prompt):
+                return [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps(state)}]
+            self.assertFalse(adapter(messages("old prompt without complete envelope examples"))[2])
+            self.assertFalse(adapter(messages(SYSTEM_PROMPT))[2])
+            self.assertTrue(adapter(messages(SYSTEM_PROMPT))[2])
+            self.assertEqual(len(client.calls), 2)
