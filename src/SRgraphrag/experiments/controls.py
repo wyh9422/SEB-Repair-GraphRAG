@@ -11,7 +11,7 @@ from ..retrieval.agent import _token_usage
 from ..retrieval.agent_actions import AgentBudget, _unique_object
 from ..retrieval.types import GraphSearchResult
 
-CONTROL_VERSION = "thesis-controls-v2"
+CONTROL_VERSION = "thesis-controls-v3"
 
 
 def mask_predicates(value):
@@ -97,15 +97,18 @@ def rerank_passages(owner, request, prior, llm, candidate_limit=30, passage_char
     ids = list(dict.fromkeys(prior.ranked_passage_ids))[:candidate_limit]
     if not ids:
         return GraphSearchResult(stop_reason="no_candidates", fallback_reason="no_candidates")
-    passages = [{"id": pid, "content": owner.chunk_embedding_store.get_row(pid)["content"][:passage_chars]}
-                for pid in ids]
-    protected = [{"id": pid, "content": owner.chunk_embedding_store.get_row(pid)["content"][:passage_chars]}
+    aliases = {f"D{i}": pid for i, pid in enumerate(ids)}
+    passages = [{"id": alias, "content": owner.chunk_embedding_store.get_row(pid)["content"][:passage_chars]}
+                for alias, pid in aliases.items()]
+    protected = [{"content": owner.chunk_embedding_store.get_row(pid)["content"][:passage_chars]}
                  for pid in request.protected_passage_ids]
     chosen, usage, event, error = choose_ids(llm, {
         "original_query": request.original_query, "bridge_query": request.retrieval_query,
         "protected_passages": protected, "candidate_passages": passages,
         "candidate_limit": candidate_limit, "passage_chars": passage_chars,
-    }, ids, field="passage_ids", maximum=5)
+    }, list(aliases), field="passage_ids", maximum=5)
+    event["passage_id_map"] = aliases
+    chosen = [aliases[alias] for alias in chosen]
     usage["candidate_passages"] = len(ids)
     # Unselected passages remain available only as deterministic empty-slot filler.
     ranked = chosen + [pid for pid in prior.ranked_passage_ids if pid not in chosen] if chosen else []

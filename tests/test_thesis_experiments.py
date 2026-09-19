@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
-from SRgraphrag.experiments.controls import choose_ids, mask_predicates, PredicateMaskedLLM, enumerate_paths, static_graph_search
+from SRgraphrag.experiments.controls import choose_ids, mask_predicates, PredicateMaskedLLM, enumerate_paths, static_graph_search, rerank_passages
 from SRgraphrag.graph.relation_index import RelationIndex
 from SRgraphrag.graph.schema import entity_id, passage_id
-from SRgraphrag.retrieval.types import GraphSearchRequest
+from SRgraphrag.retrieval.types import GraphSearchRequest, GraphSearchResult
 
 spec = importlib.util.spec_from_file_location("thesis_runner", ROOT / "scripts/run_thesis_experiments.py")
 runner = importlib.util.module_from_spec(spec)
@@ -63,6 +64,20 @@ class ControlsTests(unittest.TestCase):
         self.assertEqual(ids, [])
         self.assertEqual(error, "ValueError")
         self.assertEqual(event["selection_error"], "invalid_selection_ids")
+
+    def test_rerank_aliases_map_back_without_exposing_protected_only_ids(self):
+        protected = self.request.protected_passage_ids[0]
+        owner = SimpleNamespace(chunk_embedding_store=SimpleNamespace(get_row=lambda pid: {"content": "Text " + str(pid==protected)}))
+        def select(messages):
+            context = json.loads(messages[1]["content"])
+            self.assertEqual(context["selectable_ids"], ["D0", "D1"])
+            self.assertNotIn(protected, messages[1]["content"])
+            self.assertNotIn("candidate-a", messages[1]["content"])
+            return '{"passage_ids":["D1"]}'
+        result = rerank_passages(owner, self.request, GraphSearchResult(ranked_passage_ids=["candidate-a", "candidate-b"]), select)
+        self.assertEqual(result.ranked_passage_ids, ["candidate-b", "candidate-a"])
+        self.assertEqual(result.trace[0]["passage_id_map"], {"D0": "candidate-a", "D1": "candidate-b"})
+        self.assertIsNone(result.fallback_reason)
 
     def test_masked_adapter_preserves_limits_and_opaque_ids(self):
         received = []
