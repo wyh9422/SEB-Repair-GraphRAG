@@ -5,3 +5,17 @@ __pycache__/
 dist/
 build/
 .env
+
+# IDE
+.idea/
+
+# Large regenerable embedding / graph / cache artifacts (do NOT commit)
+*.parquet
+*.pickle
+*.faiss
+*.sqlite
+*.sqlite.lock
+outputs/**/chunk_embeddings/
+outputs/**/entity_embeddings/
+outputs/**/fact_embeddings/
+outputs/**/llm_cache/

@@ -47,7 +47,7 @@ class QuerySolution:
             "answer": self.answer,
             "gold_answers": self.gold_answers,
             "docs": self.docs[:5],
-            "doc_scores": [round(v, 4) for v in self.doc_scores.tolist()[:5]]  if self.doc_scores is not None else None,
+            "doc_scores": [round(float(v), 4) if v is not None and np.isfinite(v) else None for v in list(self.doc_scores)[:5]] if self.doc_scores is not None else None,
             "gold_docs": self.gold_docs,
         }
 
@@ -102,6 +102,8 @@ def flatten_facts(chunk_triples: List[Triple]) -> List[Triple]:
     return graph_triples
 
 def min_max_normalize(x):
+    if np.size(x) == 0:
+        return np.asarray(x, dtype=float)
     min_val = np.min(x)
     max_val = np.max(x)
     range_val = max_val - min_val

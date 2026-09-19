@@ -12,8 +12,6 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 from igraph import Graph
 import igraph as ig
-import numpy as np
-from collections import defaultdict
 import re
 import time
 from openai import BadRequestError
@@ -22,8 +20,6 @@ from .llm import _get_llm_class, BaseLLM
 from .embedding_model import _get_embedding_model_class, BaseEmbeddingModel
 from .embedding_store import EmbeddingStore
 from .information_extraction import OpenIE
-from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
-from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
 from .evaluation.retrieval_eval import RetrievalRecall
 from .evaluation.qa_eval import QAExactMatch, QAF1Score
 from .prompts.linking import get_query_instruction
@@ -34,6 +30,24 @@ from .utils.misc_utils import NerRawOutput, TripleRawOutput
 from .utils.embed_utils import retrieve_knn
 from .utils.typing import Triple
 from .utils.config_utils import BaseConfig
+from .retrieval.evidence import (
+    align_scores_to_top5,
+    apply_evidence_injection_top5,
+    apply_guard_top5_protect_evidence,
+    dedup_preserve,
+)
+from .retrieval.facts import build_subject_cap_instruction, count_unique_subjects
+from .retrieval.judge import judge_answerability_and_bridge, resolve_judge_metadata
+from .retrieval.types import GraphSearchRequest, GraphSearchResult
+from .retrieval.seeds import build_fact_seeds
+from .retrieval.ppr import PPRGraphSearch
+from .retrieval.metrics import (
+    all_recall_at_k,
+    avg_recall_at_k,
+    hit_at_1,
+    missing_list,
+    mrr_first_hit,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +142,10 @@ class SRgraphrag:
         if self.global_config.openie_mode == 'online':
             self.openie = OpenIE(llm_model=self.llm_model)
         elif self.global_config.openie_mode == 'offline':
+            from .information_extraction.openie_vllm_offline import VLLMOfflineOpenIE
             self.openie = VLLMOfflineOpenIE(self.global_config)
         elif self.global_config.openie_mode ==  'Transformers-offline':
+            from .information_extraction.openie_transformers_offline import TransformersOfflineOpenIE
             self.openie = TransformersOfflineOpenIE(self.global_config)
 
         self.graph = self.initialize_graph()
@@ -202,6 +218,8 @@ class SRgraphrag:
 
     def pre_openie(self,  docs: List[str]):
         logger.info(f"Indexing Documents")
+        self._relation_index = None
+        self.ready_to_retrieve = False
         logger.info(f"Performing OpenIE Offline")
 
         chunks = self.chunk_embedding_store.get_missing_string_hash_ids(docs)
@@ -296,6 +314,7 @@ class SRgraphrag:
                 A list of documents to be deleted.
         """
 
+        self._relation_index = None
         #Making sure that all the necessary structures have been built.
         if not self.ready_to_retrieve:
             self.prepare_retrieval_objects()
@@ -379,327 +398,15 @@ class SRgraphrag:
         judge_batch_size: int = 100,
         prompt_json: str = "src/SRgraphrag/prompts/dspy_prompts/judge_prompt.json",
     ) -> list[dict]:
-        """
-        Batched concurrent judging with DeepSeek.
-
-        Input:
-        - queries: N queries
-        - top5_docs_list: N lists, each is top-5 docs (strings)
-
-        Output:
-        - list[dict] length N, each:
-            {
-            "can_answer": bool,
-            "evidence_ids": ["D1"...],
-            "evidence_docs": [doc_str...],
-            "analysis_zh": str,
-            "bridge_possible": bool,
-            "bridge_question": str,
-            "bridge_evidence_ids": ["D1"...],
-            "bridge_analysis_zh": str,
-            optional "_error","_raw"
-            }
-        """
-        import os, json, asyncio, random
-        import aiohttp
-
-        assert len(queries) == len(top5_docs_list), "len(queries) must equal len(top5_docs_list)"
-
-        BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-        MODEL = judge_model_name
-        API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
-        if not API_KEY:
-            raise RuntimeError("DEEPSEEK_API_KEY is empty")
-
-        # -------------------------
-        # Load prompts from JSON
-        # Expected keys:
-        # - system_prompt: str
-        # - user_prefix: str
-        # - doc_max_chars: int (optional)
-        # - query_max_chars: int (optional)
-        # -------------------------
-        with open(prompt_json, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        if not isinstance(cfg, dict):
-            raise ValueError("prompt_json must be a JSON object")
-
-        if "system_prompt" not in cfg or "user_prefix" not in cfg:
-            raise KeyError("prompt_json must contain keys: system_prompt, user_prefix")
-
-        SYSTEM_PROMPT = str(cfg["system_prompt"])
-        USER_PREFIX = str(cfg["user_prefix"])
-
-        DOC_MAX_CHARS = int(cfg.get("doc_max_chars", 200000))
-        QUERY_MAX_CHARS = int(cfg.get("query_max_chars", 2000))
-
-        def _compact_text(s, max_chars: int) -> str:
-            if s is None:
-                return ""
-            s = str(s).replace("\x00", " ")
-            if len(s) > max_chars:
-                return s[:max_chars] + " ...[TRUNCATED]"
-            return s
-
-        def _prep_docs(top5):
-            docs = list(top5 or [])[:5]
-            while len(docs) < 5:
-                docs.append("")
-            return [_compact_text(d, DOC_MAX_CHARS) for d in docs]
-
-        def _normalize_id(x) -> str:
-            x = str(x).strip().upper()
-            if x.startswith("D") and len(x) >= 2 and x[1].isdigit():
-                return "D" + x[1]
-            return x
-
-        def _ids_to_docs(ids, top5_docs):
-            out = []
-            top5_docs = list(top5_docs or [])
-            for i in ids or []:
-                i = _normalize_id(i)
-                if i in ("D1", "D2", "D3", "D4", "D5"):
-                    idx = int(i[1]) - 1
-                    if 0 <= idx < len(top5_docs):
-                        out.append(top5_docs[idx])
-            return out
-
-        async def _deepseek_chat(session: aiohttp.ClientSession, payload: dict, max_retries: int = 6) -> dict:
-            url = f"{BASE_URL}/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-            last_err = None
-            for attempt in range(max_retries):
-                try:
-                    async with session.post(url, headers=headers, json=payload) as resp:
-                        text = await resp.text()
-                        if resp.status != 200:
-                            if resp.status in (408, 429, 500, 502, 503, 504):
-                                last_err = f"HTTP {resp.status}"
-                                await asyncio.sleep(min(30, 2 ** attempt) + random.random())
-                                continue
-                            return {"_error": f"HTTP {resp.status}", "_raw": text}
-                        try:
-                            return json.loads(text)
-                        except Exception:
-                            return {"_error": "JSON_DECODE_FAIL", "_raw": text}
-                except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                    last_err = f"{type(e).__name__}: {e}"
-                    await asyncio.sleep(min(30, 2 ** attempt) + random.random())
-            return {"_error": "retry_exhausted", "_raw": str(last_err)}
-
-        def _extract_json(raw: dict) -> dict:
-            if not isinstance(raw, dict):
-                return {
-                    "can_answer": False,
-                    "evidence_ids": [],
-                    "analysis_zh": "Call failed: raw is not a dictionary",
-                    "bridge_possible": False,
-                    "bridge_question": "",
-                    "bridge_evidence_ids": [],
-                    "bridge_analysis_zh": "",
-                    "_error": "raw_not_dict",
-                    "_raw": str(raw),
-                }
-
-            if "_error" in raw:
-                return {
-                    "can_answer": False,
-                    "evidence_ids": [],
-                    "analysis_zh": f"Call failed: {raw.get('_error','unknown')}",
-                    "bridge_possible": False,
-                    "bridge_question": "",
-                    "bridge_evidence_ids": [],
-                    "bridge_analysis_zh": "",
-                    "_error": raw.get("_error", ""),
-                    "_raw": raw.get("_raw", ""),
-                }
-
-            try:
-                content = raw["choices"][0]["message"]["content"].strip()
-            except Exception:
-                return {
-                    "can_answer": False,
-                    "evidence_ids": [],
-                    "analysis_zh": "Returns a structural exception",
-                    "bridge_possible": False,
-                    "bridge_question": "",
-                    "bridge_evidence_ids": [],
-                    "bridge_analysis_zh": "",
-                    "_error": "bad_response_shape",
-                    "_raw": raw,
-                }
-
-            try:
-                return json.loads(content)
-            except Exception:
-                l = content.find("{")
-                r = content.rfind("}")
-                if l != -1 and r != -1 and r > l:
-                    try:
-                        return json.loads(content[l:r + 1])
-                    except Exception:
-                        pass
-                return {
-                    "can_answer": False,
-                    "evidence_ids": [],
-                    "analysis_zh": "The model output cannot be parsed as JSON.",
-                    "bridge_possible": False,
-                    "bridge_question": "",
-                    "bridge_evidence_ids": [],
-                    "bridge_analysis_zh": "",
-                    "_error": "non_json_output",
-                    "_raw": content,
-                }
-
-        def _build_user_prompt(query: str, top5_docs: list[str]) -> str:
-            q = _compact_text(query, QUERY_MAX_CHARS)
-            d1, d2, d3, d4, d5 = _prep_docs(top5_docs)
-
-            body = (
-                "query: " + q + "\n\n"
-                "Retrieved top-5 docs (ID -> FULL content):\n"
-                "D1: " + d1 + "\n\n"
-                "D2: " + d2 + "\n\n"
-                "D3: " + d3 + "\n\n"
-                "D4: " + d4 + "\n\n"
-                "D5: " + d5
-            )
-            return USER_PREFIX + body
-
-        async def _judge_one(
-            sem: asyncio.Semaphore,
-            session: aiohttp.ClientSession,
-            query: str,
-            top5_docs: list[str],
-        ) -> dict:
-            user_prompt = _build_user_prompt(query, top5_docs)
-
-            payload = {
-                "model": MODEL,
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                "temperature": 0.0,
-            }
-
-            async with sem:
-                raw = await _deepseek_chat(session, payload)
-
-            parsed = _extract_json(raw)
-
-            can_answer = bool(parsed.get("can_answer", False))
-
-            ev_ids = parsed.get("evidence_ids", [])
-            if not isinstance(ev_ids, list):
-                ev_ids = []
-            ev_ids = [_normalize_id(x) for x in ev_ids]
-            ev_ids = [x for x in ev_ids if x in ("D1", "D2", "D3", "D4", "D5")][:5]
-            ev_docs = _ids_to_docs(ev_ids, top5_docs)
-
-            bridge_possible = bool(parsed.get("bridge_possible", False))
-            bridge_question = str(parsed.get("bridge_question", "") or "").strip()
-            bridge_ids = parsed.get("bridge_evidence_ids", [])
-            if not isinstance(bridge_ids, list):
-                bridge_ids = []
-            bridge_ids = [_normalize_id(x) for x in bridge_ids]
-            bridge_ids = [x for x in bridge_ids if x in ("D1", "D2", "D3", "D4", "D5")][:5]
-
-            if can_answer:
-                bridge_possible = False
-                bridge_question = ""
-                bridge_ids = []
-                bridge_analysis_zh = ""
-            else:
-                if not bridge_possible:
-                    bridge_question = ""
-                    bridge_ids = []
-                    bridge_analysis_zh = ""
-                else:
-                    bridge_analysis_zh = str(parsed.get("bridge_analysis_zh", "") or "")
-
-            out = {
-                "can_answer": can_answer,
-                "evidence_ids": ev_ids,
-                "evidence_docs": ev_docs,
-                "analysis_zh": str(parsed.get("analysis_zh", "") or ""),
-                "bridge_possible": bridge_possible,
-                "bridge_question": bridge_question,
-                "bridge_evidence_ids": bridge_ids,
-                "bridge_analysis_zh": bridge_analysis_zh,
-            }
-            if isinstance(parsed, dict) and "_error" in parsed:
-                out["_error"] = parsed.get("_error")
-            if isinstance(parsed, dict) and "_raw" in parsed:
-                out["_raw"] = parsed.get("_raw")
-            return out
-
-        async def _judge_batch(all_queries: list[str], all_top5: list[list[str]]) -> list[dict]:
-            from tqdm import tqdm
-
-            timeout = aiohttp.ClientTimeout(total=360, connect=30, sock_connect=60, sock_read=300)
-            connector = aiohttp.TCPConnector(
-                limit=max(1, judge_concurrency) * 2,
-                limit_per_host=max(1, judge_concurrency),
-                ttl_dns_cache=300,
-                enable_cleanup_closed=True,
-            )
-            sem = asyncio.Semaphore(max(1, judge_concurrency))
-
-            results: list[dict] = [None] * len(all_queries)  # type: ignore
-            total_n = len(all_queries)
-            pbar = tqdm(total=total_n, desc=f"Judge[{MODEL}] (conc={judge_concurrency}, batch={judge_batch_size})")
-
-            async def _judge_one_with_idx(i: int):
-                r = await _judge_one(sem, session, all_queries[i], all_top5[i])
-                return i, r
-
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                for start in range(0, total_n, max(1, judge_batch_size)):
-                    end = min(total_n, start + max(1, judge_batch_size))
-                    tasks = [asyncio.create_task(_judge_one_with_idx(i)) for i in range(start, end)]
-
-                    for fut in asyncio.as_completed(tasks):
-                        try:
-                            i, r = await fut
-                            results[i] = r
-                        except Exception as e:
-                            i = start
-                            results[i] = {
-                                "can_answer": False,
-                                "evidence_ids": [],
-                                "evidence_docs": [],
-                                "analysis_zh": f"judge异常: {type(e).__name__}",
-                                "bridge_possible": False,
-                                "bridge_question": "",
-                                "bridge_evidence_ids": [],
-                                "bridge_analysis_zh": "",
-                                "_error": "judge_exception",
-                                "_raw": str(e),
-                            }
-                        pbar.update(1)
-
-            pbar.close()
-
-            # Ensure no None leaks out (prevents AttributeError upstream)
-            for i in range(len(results)):
-                if results[i] is None:
-                    results[i] = {
-                        "can_answer": False,
-                        "evidence_ids": [],
-                        "evidence_docs": [],
-                        "analysis_zh": "judge异常: result is None",
-                        "bridge_possible": False,
-                        "bridge_question": "",
-                        "bridge_evidence_ids": [],
-                        "bridge_analysis_zh": "",
-                        "_error": "none_result",
-                        "_raw": "",
-                    }
-
-            return results  # type: ignore
-
-        return asyncio.run(_judge_batch(queries, top5_docs_list))
+        """Delegate answerability/bridge judging to the standalone service."""
+        return judge_answerability_and_bridge(
+            queries=queries,
+            top5_docs_list=top5_docs_list,
+            judge_model_name=judge_model_name,
+            judge_concurrency=judge_concurrency,
+            judge_batch_size=judge_batch_size,
+            prompt_json=prompt_json,
+        )
 
     def retrieve_full_once(
         self,
@@ -708,6 +415,11 @@ class SRgraphrag:
         num_to_retrieve: int,
         subject_cap: int = 4,
         evidence: list[str] | None = None,   # if provided: force-keep in final top5 (second-round behavior)
+        original_query: str | None = None,
+        round_index: int = 1,
+        graph_search_mode: str = "ppr",
+        agent_budget: dict | None = None,
+        agent_fallback: str = "ppr",
     ) -> dict:
         """
         Run ONE FULL retrieval for a single query:
@@ -718,189 +430,20 @@ class SRgraphrag:
         - Guard (dpr1 tail replacement) uses THIS round's dpr1, and also NEVER replaces evidence.
         - If evidence already all inside top5, injection does nothing (no extra tail replace).
         """
-        import re
-        import time
-        import numpy as np
-
-        # -------------------------
-        # build instruction by subject_cap
-        # -------------------------
-        def _cap_to_word(n: int) -> str:
-            m = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
-            return m.get(n, "four")
-
-        def _build_subject_cap_instruction(n: int) -> str:
-            n = int(n)
-            n = max(1, min(5, n))
-
-            base = (
-                "You are a critical component of a high-stakes question-answering system used by top researchers "
-                "and decision-makers worldwide. Your task is to filter facts based on their relevance to a given query, "
-                "ensuring that the most crucial information is presented to these stakeholders. The query requires careful "
-                "analysis and possibly multi-hop reasoning to connect different pieces of information. "
-                "You must select all facts from the provided candidate list that are strongly relevant to the query, "
-                "prioritizing at most four key subjects and including as many relevant facts as possible under those subjects, "
-                "while ensuring that the total number of unique subjects among the selected facts does not exceed four, "
-                "aiding in reasoning and providing an accurate answer. "
-                'The output should be in JSON format, e.g., {"fact": [["s1", "p1", "o1"], ["s2", "p2", "o2"]]}, '
-                'and if no facts are relevant, return an empty list, {"fact": []}. '
-                "The accuracy of your response is paramount, as it will directly impact the decisions made by these high-level stakeholders. "
-                "You must only use facts from the candidate list and not generate new facts."
-            )
-            word = _cap_to_word(n)
-            out = re.sub(r"\bfour\b", word, base)
-            out = re.sub(r"\b4\b", str(n), out)
-            return out
-
-        subject_cap = int(subject_cap)
-        subject_cap = max(1, min(5, subject_cap))
-        llm_filter_instruction = _build_subject_cap_instruction(subject_cap)
-
+        subject_cap = max(1, min(5, int(subject_cap)))
+        llm_filter_instruction = build_subject_cap_instruction(subject_cap)
         if num_to_retrieve < 5:
             num_to_retrieve = 5
 
-        # -------------------------
-        # helpers
-        # -------------------------
-        def _count_unique_subjects(triples):
-            if not triples:
-                return 0
-            return len({t[0] for t in triples if isinstance(t, (list, tuple)) and len(t) >= 3})
-
-        def _dedup_preserve(xs: list[str]) -> list[str]:
-            out, seen = [], set()
-            for x in xs:
-                if x and x not in seen:
-                    out.append(x)
-                    seen.add(x)
-            return out
-
-        def _find_tail_replace_idx(cand5: list[str], protected: set[str]) -> int | None:
-            # from tail -> head, pick first slot whose doc is non-empty AND not protected
-            for j in range(4, -1, -1):
-                if cand5[j] and cand5[j] not in protected:
-                    return j
-            # if all are protected or empty, allow replacing an empty slot that is not protected (rare)
-            for j in range(4, -1, -1):
-                if (not cand5[j]) and cand5[j] not in protected:
-                    return j
-            return None
-
-        def apply_evidence_injection_top5(
-            top5: list[str],
-            evidence_docs: list[str] | None,
-            base_ranked_docs: list[str] | None,
-        ) -> tuple[list[str], dict]:
-            """
-            Inject missing evidence into top5 by tail replacement, never replacing existing evidence.
-            If evidence already covered, do nothing (no extra tail replacement).
-            """
-            log = {
-                "evidence_enabled": bool(evidence_docs),
-                "evidence_used": False,
-                "evidence_missing_cnt": 0,
-                "evidence_missing": [],
-                "replaced_cnt": 0,
+        if not self.passage_node_keys:
+            return {
+                "query": query, "final_top5": [""] * 5, "final_docs": [""] * 5,
+                "final_scores": [None] * 5, "dpr_top5": [], "dpr1": None,
+                "graph_top5": None, "graph_runnable": False, "final_source": "empty_corpus",
+                "repair_applied": False, "graph_search_mode": graph_search_mode,
+                "graph_search": GraphSearchResult(stop_reason="empty_corpus", fallback_reason="empty_corpus").to_dict(),
+                "path_protected_docs": [], "subject_cap": subject_cap,
             }
-
-            cand = list(top5 or [])[:5]
-            while len(cand) < 5:
-                cand.append("")
-
-            ev = [x for x in (evidence_docs or []) if x]
-            ev = _dedup_preserve(ev)[:5]  # caller should pass <=5, still guard here
-            if not ev:
-                # normalize (dedup+refill) but no injection
-                out = _dedup_preserve(cand)
-                if len(out) < 5 and base_ranked_docs:
-                    out += [x for x in base_ranked_docs if x and x not in set(out)]
-                out = out[:5]
-                while len(out) < 5:
-                    out.append("")
-                return out, log
-
-            ev_set = set(ev)
-            cand_set = set([x for x in cand if x])
-            missing = [x for x in ev if x not in cand_set]
-
-            log["evidence_missing"] = missing[:]
-            log["evidence_missing_cnt"] = len(missing)
-            log["evidence_used"] = (len(missing) > 0)
-
-            replaced = 0
-            if missing:
-                # replace from tail: pick first slot that is NOT evidence
-                for e in missing:
-                    idx = _find_tail_replace_idx(cand, protected=ev_set)
-                    if idx is None:
-                        break
-                    cand[idx] = e
-                    replaced += 1
-
-            log["replaced_cnt"] = replaced
-
-            # dedup + refill
-            out = _dedup_preserve(cand)
-            if len(out) < 5 and base_ranked_docs:
-                out += [x for x in base_ranked_docs if x and x not in set(out)]
-            out = out[:5]
-            while len(out) < 5:
-                out.append("")
-
-            # invariant best-effort: all ev that can fit should be in out
-            # (if ev>5 we truncated; if protected slots fill all 5, cannot inject more)
-            return out, log
-
-        def apply_guard_top5_protect_evidence(
-            top5: list[str],
-            dpr1: str | None,
-            protected_docs: set[str],
-        ) -> tuple[list[str], dict]:
-            """
-            Tail replace with THIS round's dpr1 if not already present.
-            Never replace protected evidence docs.
-            """
-            log = {"guard_enabled": True, "guard_triggered": False, "guard_replaced_idx": None}
-
-            if not dpr1:
-                return top5, log
-            if dpr1 in set([x for x in top5 if x]):
-                return top5, log
-
-            cand = list(top5 or [])[:5]
-            while len(cand) < 5:
-                cand.append("")
-
-            idx = _find_tail_replace_idx(cand, protected=protected_docs)
-            if idx is None:
-                return cand[:5], log
-
-            cand[idx] = dpr1
-            log["guard_triggered"] = True
-            log["guard_replaced_idx"] = int(idx)
-
-            # dedup but keep length 5 with refill by internal caller
-            out = _dedup_preserve(cand)[:5]
-            while len(out) < 5:
-                out.append("")
-            return out, log
-        
-        def _align_scores_to_top5(top5_docs: list[str], base_docs: list[str], base_scores):
-            if base_scores is None:
-                base_scores_list = []
-            else:
-                base_scores_list = [float(x) for x in list(base_scores)]
-            base_docs_list = list(base_docs or [])
-
-            doc2score = {}
-            for d, s in zip(base_docs_list, base_scores_list):
-                if d and d not in doc2score:
-                    doc2score[d] = float(s)
-
-            out_scores = []
-            for d in top5_docs:
-                out_scores.append(float(doc2score.get(d, float("-inf"))) if d else float("-inf"))
-            return out_scores
 
         # -------------------------
         # A) DPR (THIS round)
@@ -939,27 +482,48 @@ class SRgraphrag:
         rerank_end = time.time()
         self.rerank_time += (rerank_end - rerank_start)
 
-        unique_subj_before = _count_unique_subjects(raw_top30_triples)
-        unique_subj_after = _count_unique_subjects(filtered_triples)
+        unique_subj_before = count_unique_subjects(raw_top30_triples)
+        unique_subj_after = count_unique_subjects(filtered_triples)
 
         ppr_runnable = (len(top_k_facts) > 0)
 
-        if ppr_runnable:
-            ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.graph_search_with_fact_entities(
-                query=query,
-                link_top_k=self.global_config.linking_top_k,
-                query_fact_scores=query_fact_scores,
-                top_k_facts=top_k_facts,
-                top_k_fact_indices=top_k_fact_indices,
-                passage_node_weight=self.global_config.passage_node_weight,
+        search_result = GraphSearchResult(stop_reason="no_filtered_facts", fallback_reason="no_filtered_facts")
+        path_docs = []
+        repair_applied = True
+        if ppr_runnable or graph_search_mode != "ppr":
+            from .retrieval.dispatch import search_graph
+            fact_ids, seed_scores, missing_seeds = build_fact_seeds(
+                top_k_facts, top_k_fact_indices, query_fact_scores,
+                self.entity_node_keys, self.ent_node_to_chunk_ids or {},
+                self.global_config.linking_top_k,
             )
-            ppr_top_docs = [
-                self.chunk_embedding_store.get_row(self.passage_node_keys[idx])["content"]
-                for idx in ppr_sorted_doc_ids[:num_to_retrieve]
-            ]
-            final_docs_base = list(ppr_top_docs)
-            final_scores = ppr_sorted_doc_scores[:num_to_retrieve]
-            final_source = "graph"
+            protected_ids = [compute_mdhash_id(doc, prefix="chunk-") for doc in (evidence or []) if doc]
+            request = GraphSearchRequest(
+                original_query=original_query or query, retrieval_query=query, round_index=round_index,
+                seed_fact_ids=fact_ids, seed_entity_ids=list(seed_scores), seed_scores=seed_scores,
+                protected_passage_ids=list(dict.fromkeys(protected_ids))[:5],
+                retrieval_limit=num_to_retrieve, budget=dict(agent_budget or {}),
+            )
+            search_result = search_graph(self, request, mode=graph_search_mode, fallback=agent_fallback)
+            search_result.usage["missing_seed_ids"] = missing_seeds
+            final_docs_base = [self.chunk_embedding_store.get_row(key)["content"] for key in search_result.ranked_passage_ids]
+            final_scores = list(search_result.scores)
+            if search_result.selected_paths:
+                path_docs = list(final_docs_base)
+                if len(set(path_docs) | set(doc for doc in (evidence or []) if doc)) > 5:
+                    raise ValueError("Committed path sources exceed the protected Top-5 capacity")
+                # Paths carry no probability score. Remaining ranked passages
+                # may fill unused slots, but cannot evict path provenance.
+                for doc, score in zip(dpr_top_docs, dpr_sorted_doc_scores):
+                    if doc not in final_docs_base and len(final_docs_base) < num_to_retrieve:
+                        final_docs_base.append(doc)
+                        final_scores.append(float(score))
+            ppr_top_docs = list(final_docs_base) if "ppr" in search_result.score_sources else None
+            final_source = ("agent" if search_result.selected_paths else
+                            "graph" if "ppr" in search_result.score_sources else "dpr_fallback")
+            repair_applied = bool(search_result.ranked_passage_ids)
+            if not repair_applied:
+                final_source = "no_repair"
         else:
             final_docs_base = list(dpr_top_docs)
             final_scores = dpr_sorted_doc_scores[:num_to_retrieve]
@@ -974,8 +538,8 @@ class SRgraphrag:
         # C) evidence injection (only meaningful when evidence is provided)
         #    MUST happen before guard; protects evidence in subsequent guard.
         # -------------------------
-        ev = [x for x in (evidence or []) if x]
-        ev = _dedup_preserve(ev)[:5]
+        ev = [x for x in list(evidence or []) + path_docs if x]
+        ev = dedup_preserve(ev)[:5]
         protected_set = set(ev)
 
         top5_after_inj, ev_log = apply_evidence_injection_top5(
@@ -991,14 +555,14 @@ class SRgraphrag:
         # -------------------------
         top5_after_guard, guard_log = apply_guard_top5_protect_evidence(
             top5=top5_after_inj,
-            dpr1=dpr1,
+            dpr1=dpr1 if repair_applied else None,
             protected_docs=protected_set,
         )
 
         # -------------------------
         # E) final normalize: dedup + refill from base ranked docs (does not "inject" extra evidence)
         # -------------------------
-        final_top5 = _dedup_preserve(top5_after_guard)
+        final_top5 = dedup_preserve(top5_after_guard)
         if len(final_top5) < 5:
             seen = set(final_top5)
             for x in (final_docs_base or []):
@@ -1013,10 +577,10 @@ class SRgraphrag:
 
         # E2) align scores with final_top5 after injection/guard
         if final_scores is not None:
-            aligned_top5_scores = _align_scores_to_top5(final_top5, final_docs_base, final_scores)
-            final_scores = [float(x) for x in list(final_scores)]
+            aligned_top5_scores = align_scores_to_top5(final_top5, final_docs_base, final_scores)
+            final_scores = [float(x) if x is not None and np.isfinite(x) else None for x in list(final_scores)]
             if len(final_scores) < len(final_docs_base):
-                final_scores += [float("-inf")] * (len(final_docs_base) - len(final_scores))
+                final_scores += [None] * (len(final_docs_base) - len(final_scores))
             final_scores[:5] = aligned_top5_scores
         
 
@@ -1041,6 +605,10 @@ class SRgraphrag:
             "graph_top5": (ppr_top_docs[:5] if ppr_top_docs else None),
             "graph_runnable": bool(ppr_runnable),
             "final_source": final_source,
+            "repair_applied": repair_applied,
+            "graph_search_mode": graph_search_mode,
+            "graph_search": search_result.to_dict(),
+            "path_protected_docs": path_docs,
 
             # filter logs
             "subject_cap": int(subject_cap),
@@ -1076,6 +644,11 @@ class SRgraphrag:
         judge_batch_size: int = 100,
         judge_model_name: str = "deepseek-reasoner",
         keep_miss_distribution: bool = True,   # whether to keep/save miss distribution
+        graph_search_mode: str = "ppr",
+        agent_apply_to: str = "round2",
+        agent_budget: dict | None = None,
+        agent_fallback: str = "ppr",
+        round1_replay: list[dict] | None = None,
     ) -> list["QuerySolution"] | tuple[list["QuerySolution"], dict]:
         """
         Iterative retrieval (max 2 rounds):
@@ -1093,71 +666,31 @@ class SRgraphrag:
         # -------------------------
         # setup
         # -------------------------
+        if graph_search_mode not in ("ppr", "agent", "hybrid") or agent_apply_to != "round2":
+            raise ValueError("Supported modes are ppr/agent/hybrid, applied to round2 only")
+        if agent_fallback not in ("ppr", "dpr", "none"):
+            raise ValueError("Unsupported Agent fallback")
+        if gold_docs is not None and len(gold_docs) != len(queries):
+            raise ValueError("gold_docs must align with queries")
         if num_to_retrieve is None:
             num_to_retrieve = self.global_config.retrieval_top_k
         if num_to_retrieve < 5:
             num_to_retrieve = 5
 
-        if not self.ready_to_retrieve:
+        if queries and not self.ready_to_retrieve:
             self.prepare_retrieval_objects()
 
-        self.get_query_embeddings(queries)
+        if queries and getattr(self, "passage_node_keys", True):
+            self.get_query_embeddings(queries)
 
         out_dir = None
         if result_save_root is not None:
             out_dir = os.path.join(result_save_root, dataset_name, f"ITER_cap{int(subject_cap)}")
+            if graph_search_mode != "ppr":
+                out_dir += "_" + graph_search_mode
             os.makedirs(out_dir, exist_ok=True)
 
         metrics_summary_path = os.path.join(out_dir, f"{dataset_name}_metrics_summary.json") if out_dir else None
-
-        # -------------------------
-        # helpers (metrics)
-        # -------------------------
-        def avg_recall_at_k(golds: list[list[str]], retrieved_topk_list: list[list[str]]) -> float:
-            n = len(golds)
-            s = 0.0
-            denom = 0
-            for i in range(n):
-                g = golds[i] or []
-                if len(g) == 0:
-                    continue
-                denom += 1
-                rset = set(retrieved_topk_list[i])
-                hit = sum(1 for x in g if x in rset)
-                s += hit / len(g)
-            return s / denom if denom > 0 else 0.0
-
-        def all_recall_at_k(golds: list[list[str]], retrieved_topk_list: list[list[str]]) -> float:
-            n = len(golds)
-            hit = 0
-            denom = 0
-            for i in range(n):
-                g = golds[i] or []
-                if len(g) == 0:
-                    continue
-                denom += 1
-                rset = set(retrieved_topk_list[i])
-                if all(x in rset for x in g):
-                    hit += 1
-            return hit / denom if denom > 0 else 0.0
-
-        def missing_list(gold: list[str], topk_docs: list[str]) -> list[str]:
-            rset = set(topk_docs)
-            return [g for g in (gold or []) if g not in rset]
-
-        def hit_at_1(gold: list[str], ranked: list[str]) -> int:
-            if not gold or not ranked:
-                return 0
-            return 1 if ranked[0] in set(gold) else 0
-
-        def mrr_first_hit(gold: list[str], ranked: list[str]) -> float:
-            if not gold:
-                return 0.0
-            gset = set(gold)
-            for idx, doc in enumerate(ranked):
-                if doc in gset:
-                    return 1.0 / (idx + 1)
-            return 0.0
 
         # -------------------------
         # run
@@ -1178,13 +711,17 @@ class SRgraphrag:
         # Phase-1: round1 for all
         round1_pack = [None] * len(queries)
         round1_top5 = [None] * len(queries)
+        self.last_retrieval_trace = []
+        if round1_replay is not None:
+            if len(round1_replay) != len(queries) or any(row.get("query") != q for row, q in zip(round1_replay, queries)):
+                raise ValueError("Round-1 replay must match query order exactly")
 
         for q_idx, query in tqdm(
             enumerate(queries),
             desc=f"IterRetrieve-R1[{dataset_name}|cap{int(subject_cap)}]",
             total=len(queries),
         ):
-            r1 = self.retrieve_full_once(
+            r1 = round1_replay[q_idx]["round1"] if round1_replay is not None else self.retrieve_full_once(
                 query=query,
                 num_to_retrieve=num_to_retrieve,
                 subject_cap=subject_cap,
@@ -1194,13 +731,15 @@ class SRgraphrag:
             round1_top5[q_idx] = r1["final_top5"]
 
         # Phase-2: judge for all (batched concurrent)
-        judge1_all = self.judge_answerability_and_bridge(
+        no_evidence = queries and not any(any(top5) for top5 in round1_top5)
+        judge1_all = ([{"can_answer": False, "bridge_possible": False, "bridge_question": "", "evidence_docs": [], "_error": "empty_corpus"} for _ in queries] if no_evidence else
+            [row["judge1"] for row in round1_replay] if round1_replay is not None else self.judge_answerability_and_bridge(
             judge_model_name=judge_model_name,
             queries=queries,
             top5_docs_list=round1_top5,
             judge_concurrency=judge_concurrency,
             judge_batch_size=judge_batch_size,
-        )
+        )) if queries else []
 
         # Phase-3: round2 only for bridge_possible
         for q_idx, query in tqdm(
@@ -1230,14 +769,30 @@ class SRgraphrag:
                         num_to_retrieve=num_to_retrieve,
                         subject_cap=subject_cap,
                         evidence=evidence_docs_r1,
+                        original_query=query,
+                        round_index=2,
+                        graph_search_mode=graph_search_mode,
+                        agent_budget=agent_budget,
+                        agent_fallback=agent_fallback,
                     )
-                    final_top5 = r2["final_top5"]
+                    if r2.get("repair_applied", True):
+                        final_top5 = r2["final_top5"]
 
             # keep docs container from r1 for compatibility; overwrite top5
             final_docs = list(r1["final_docs"])
             final_docs[:5] = final_top5
-            retrieval_results.append(QuerySolution(question=query, docs=final_docs, doc_scores=r1["final_scores"]))
+            score_round = r2 if r2 is not None and r2.get("repair_applied", True) else r1
+            final_scores = align_scores_to_top5(final_top5, score_round["final_docs"], score_round["final_scores"])
+            final_scores += align_scores_to_top5(final_docs[5:], r1["final_docs"], r1["final_scores"])
+            retrieval_results.append(QuerySolution(question=query, docs=final_docs, doc_scores=final_scores))
             final_top5_all.append(final_top5)
+            self.last_retrieval_trace.append({
+                "query": query, "round1": r1, "judge1": judge1, "round2": r2,
+                "round_used": round_used, "final_top5": final_top5,
+                "final_docs": final_docs, "final_scores": final_scores,
+                "score_round": 2 if score_round is r2 else 1,
+                "graph_search_mode": graph_search_mode,
+            })
 
             gold = gold_docs[q_idx] if gold_docs is not None else None
             if gold is not None:
@@ -1289,10 +844,19 @@ class SRgraphrag:
         t1 = time.time()
         self.all_retrieval_time += (t1 - t0)
 
+        if out_dir:
+            with open(os.path.join(out_dir, "retrieval_trace.jsonl"), "w", encoding="utf-8") as trace_file:
+                for row in self.last_retrieval_trace:
+                    trace_file.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
         if gold_docs is None:
             return retrieval_results
 
         total_q = len(gold_docs)
+        requested_judge_metadata = resolve_judge_metadata(judge_model_name, judge_concurrency, judge_batch_size)
+        actual_metadata = [row.get("_judge_metadata") for row in judge1_all if row.get("_judge_metadata")]
+        actual_judge_metadata = (actual_metadata[0] if actual_metadata else
+                                 {"status": "unavailable_replayed"} if round1_replay is not None else requested_judge_metadata)
 
         metrics = {
             "dataset": dataset_name,
@@ -1311,8 +875,14 @@ class SRgraphrag:
 
             "judge_concurrency": int(judge_concurrency),
             "judge_batch_size": int(judge_batch_size),
-            "judge_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
-            "judge_base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/"),
+            "judge_model": actual_judge_metadata.get("judge_model"),
+            "judge_metadata": actual_judge_metadata,
+            "requested_judge_metadata": requested_judge_metadata,
+            "graph_search_mode": graph_search_mode,
+            "agent_apply_to": agent_apply_to,
+            "agent_budget": agent_budget or {},
+            "agent_fallback": agent_fallback,
+            "round1_replayed": round1_replay is not None,
         }
 
         if keep_miss_distribution:
@@ -1353,7 +923,20 @@ class SRgraphrag:
                queries: List[str|QuerySolution],
                gold_docs: List[List[str]] = None,
                gold_answers: List[List[str]] = None,
-               dataset_name: str = "unknown_dataset") -> Tuple[List[QuerySolution], List[str], List[Dict]] | Tuple[List[QuerySolution], List[str], List[Dict], Dict, Dict]:
+               dataset_name: str = "unknown_dataset", *,
+               num_to_retrieve: int | None = None,
+               result_save_root: str | None = None,
+               eval_k_list: tuple = (1, 2, 5, 30),
+               subject_cap: int = 4,
+               judge_concurrency: int = 100,
+               judge_batch_size: int = 100,
+               judge_model_name: str = "deepseek-reasoner",
+               keep_miss_distribution: bool = True,
+               graph_search_mode: str = "ppr",
+               agent_apply_to: str = "round2",
+               agent_budget: dict | None = None,
+               agent_fallback: str = "ppr",
+               round1_replay: list[dict] | None = None) -> Tuple:
         """
         Performs retrieval-augmented generation enhanced QA using the SRgraphrag 2 framework.
 
@@ -1383,6 +966,12 @@ class SRgraphrag:
                 - A dictionary with overall QA evaluation metrics (exact match and F1 scores).
 
         """
+        if gold_docs is not None and len(gold_docs) != len(queries):
+            raise ValueError("gold_docs must align with queries")
+        if gold_answers is not None and len(gold_answers) != len(queries):
+            raise ValueError("gold_answers must align with queries")
+        if not queries:
+            return ([], [], [], {}, {}) if gold_answers is not None else ([], [], [])
         if gold_answers is not None:
             qa_em_evaluator = QAExactMatch(global_config=self.global_config)
             qa_f1_evaluator = QAF1Score(global_config=self.global_config)
@@ -1391,10 +980,19 @@ class SRgraphrag:
         overall_retrieval_result = None
 
         if not isinstance(queries[0], QuerySolution):
+            retrieval = self.retrieve(
+                queries=queries, gold_docs=gold_docs, dataset_name=dataset_name,
+                num_to_retrieve=num_to_retrieve, result_save_root=result_save_root,
+                eval_k_list=eval_k_list, subject_cap=subject_cap,
+                judge_concurrency=judge_concurrency, judge_batch_size=judge_batch_size,
+                judge_model_name=judge_model_name, keep_miss_distribution=keep_miss_distribution,
+                graph_search_mode=graph_search_mode, agent_apply_to=agent_apply_to,
+                agent_budget=agent_budget, agent_fallback=agent_fallback, round1_replay=round1_replay,
+            )
             if gold_docs is not None:
-                queries, overall_retrieval_result = self.retrieve(queries=queries,gold_docs=gold_docs,eval_k_list=[5],dataset_name=dataset_name)
+                queries, overall_retrieval_result = retrieval
             else:
-                queries = self.retrieve(queries=queries)
+                queries = retrieval
 
         # Performing QA
         queries_solutions, all_response_message, all_metadata = self.qa(queries)
@@ -2094,44 +1692,27 @@ class SRgraphrag:
         self.passage_node_keys: List = list(self.chunk_embedding_store.get_all_ids()) # a list of passage node keys
         self.fact_node_keys: List = list(self.fact_embedding_store.get_all_ids())
 
-        # Check if the graph has the expected number of nodes
-        expected_node_count = len(self.entity_node_keys) + len(self.passage_node_keys)
-        actual_node_count = self.graph.vcount()
-        
-        if expected_node_count != actual_node_count:
-            logger.warning(f"Graph node count mismatch: expected {expected_node_count}, got {actual_node_count}")
-            # If the graph is empty but we have nodes, we need to add them
-            if actual_node_count == 0 and expected_node_count > 0:
-                logger.info(f"Initializing graph with {expected_node_count} nodes")
-                self.add_new_nodes()
-                self.save_igraph()
-
-        # Create mapping from node name to vertex index
+        # Retrieval must not persist a node-only "repair" and pretend that
+        # missing edges have been reconstructed. Dense fallback remains usable.
+        self._graph_validation_error = None
+        self._relation_index = None
         try:
-            igraph_name_to_idx = {node["name"]: idx for idx, node in enumerate(self.graph.vs)} # from node key to the index in the backbone graph
-            self.node_name_to_vertex_idx = igraph_name_to_idx
-            
-            # Check if all entity and passage nodes are in the graph
-            missing_entity_nodes = [node_key for node_key in self.entity_node_keys if node_key not in igraph_name_to_idx]
-            missing_passage_nodes = [node_key for node_key in self.passage_node_keys if node_key not in igraph_name_to_idx]
-            
-            if missing_entity_nodes or missing_passage_nodes:
-                logger.warning(f"Missing nodes in graph: {len(missing_entity_nodes)} entity nodes, {len(missing_passage_nodes)} passage nodes")
-                # If nodes are missing, rebuild the graph
-                self.add_new_nodes()
-                self.save_igraph()
-                # Update the mapping
-                igraph_name_to_idx = {node["name"]: idx for idx, node in enumerate(self.graph.vs)}
-                self.node_name_to_vertex_idx = igraph_name_to_idx
-            
-            self.entity_node_idxs = [igraph_name_to_idx[node_key] for node_key in self.entity_node_keys] # a list of backbone graph node index
-            self.passage_node_idxs = [igraph_name_to_idx[node_key] for node_key in self.passage_node_keys] # a list of backbone passage node index
-        except Exception as e:
-            logger.error(f"Error creating node index mapping: {str(e)}")
-            # Initialize with empty lists if mapping fails
+            names = list(self.graph.vs["name"]) if self.graph.vcount() else []
+            self.node_name_to_vertex_idx = {name: i for i, name in enumerate(names)}
+            expected = set(self.entity_node_keys) | set(self.passage_node_keys)
+            if len(names) != len(set(names)) or not expected.issubset(self.node_name_to_vertex_idx):
+                self._graph_validation_error = "missing_or_duplicate_graph_nodes"
+            elif self.passage_node_keys and self.graph.ecount() == 0:
+                self._graph_validation_error = "missing_graph_edges"
+            elif self.graph.ecount() and "weight" not in self.graph.es.attributes():
+                self._graph_validation_error = "missing_graph_weights"
+        except (KeyError, ValueError):
             self.node_name_to_vertex_idx = {}
-            self.entity_node_idxs = []
-            self.passage_node_idxs = []
+            self._graph_validation_error = "invalid_graph_mapping"
+        self.entity_node_idxs = [self.node_name_to_vertex_idx.get(key, -1) for key in self.entity_node_keys]
+        self.passage_node_idxs = [self.node_name_to_vertex_idx.get(key, -1) for key in self.passage_node_keys]
+        if self._graph_validation_error:
+            logger.warning("PPR unavailable: %s; retrieval may use dense fallback", self._graph_validation_error)
 
         logger.info("Loading embeddings.")
         self.entity_embeddings = np.array(self.entity_embedding_store.get_embeddings(self.entity_node_keys))
@@ -2239,6 +1820,8 @@ class SRgraphrag:
             If no embedding is found for the provided query in the stored query
             embeddings dictionary.
         """
+        if len(self.fact_embeddings) == 0:
+            return np.array([])
         query_embedding = self.query_to_embedding['triple'].get(query, None)
         if query_embedding is None:
             query_embedding = self.embedding_model.batch_encode(query,
@@ -2252,7 +1835,7 @@ class SRgraphrag:
             
         try:
             query_fact_scores = np.dot(self.fact_embeddings, query_embedding.T) # shape: (#facts, )
-            query_fact_scores = np.squeeze(query_fact_scores) if query_fact_scores.ndim == 2 else query_fact_scores
+            query_fact_scores = np.asarray(query_fact_scores).reshape(-1)
             query_fact_scores = min_max_normalize(query_fact_scores)
             return query_fact_scores
         except Exception as e:
@@ -2283,13 +1866,15 @@ class SRgraphrag:
             - A numpy array of the normalized similarity scores for the corresponding
               documents.
         """
+        if len(self.passage_embeddings) == 0:
+            return np.array([], dtype=int), np.array([], dtype=float)
         query_embedding = self.query_to_embedding['passage'].get(query, None)
         if query_embedding is None:
             query_embedding = self.embedding_model.batch_encode(query,
                                                                 instruction=get_query_instruction('query_to_passage'),
                                                                 norm=True)
         query_doc_scores = np.dot(self.passage_embeddings, query_embedding.T)
-        query_doc_scores = np.squeeze(query_doc_scores) if query_doc_scores.ndim == 2 else query_doc_scores
+        query_doc_scores = np.asarray(query_doc_scores).reshape(-1)
         query_doc_scores = min_max_normalize(query_doc_scores)
 
         sorted_doc_ids = np.argsort(query_doc_scores)[::-1]
@@ -2342,113 +1927,20 @@ class SRgraphrag:
                                         top_k_facts: List[Tuple],
                                         top_k_fact_indices: List[str],
                                         passage_node_weight: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Computes document scores based on fact-based similarity and relevance using personalized
-        PageRank (PPR) and dense retrieval models. This function combines the signal from the relevant
-        facts identified with passage similarity and graph-based search for enhanced result ranking.
-
-        Parameters:
-            query (str): The input query string for which similarity and relevance computations
-                need to be performed.
-            link_top_k (int): The number of top phrases to include from the linking score map for
-                downstream processing.
-            query_fact_scores (np.ndarray): An array of scores representing fact-query similarity
-                for each of the provided facts.
-            top_k_facts (List[Tuple]): A list of top-ranked facts, where each fact is represented
-                as a tuple of its subject, predicate, and object.
-            top_k_fact_indices (List[str]): Corresponding indices or identifiers for the top-ranked
-                facts in the query_fact_scores array.
-            passage_node_weight (float): Default weight to scale passage scores in the graph.
-
-        Returns:
-            Tuple[np.ndarray, np.ndarray]: A tuple containing two arrays:
-                - The first array corresponds to document IDs sorted based on their scores.
-                - The second array consists of the PPR scores associated with the sorted document IDs.
-        """
-
-        #Assigning phrase weights based on selected facts from previous steps.
-        linking_score_map = {}  # from phrase to the average scores of the facts that contain the phrase
-        phrase_scores = {}  # store all fact scores for each phrase regardless of whether they exist in the knowledge graph or not
-        phrase_weights = np.zeros(len(self.graph.vs['name']))
-        passage_weights = np.zeros(len(self.graph.vs['name']))
-        number_of_occurs = np.zeros(len(self.graph.vs['name']))
-
-        phrases_and_ids = set()
-
-        for rank, f in enumerate(top_k_facts):
-            subject_phrase = f[0].lower()
-            predicate_phrase = f[1].lower()
-            object_phrase = f[2].lower()
-            fact_score = query_fact_scores[
-                top_k_fact_indices[rank]] if query_fact_scores.ndim > 0 else query_fact_scores
-
-            for phrase in [subject_phrase, object_phrase]:
-                phrase_key = compute_mdhash_id(
-                    content=phrase,
-                    prefix="entity-"
-                )
-                phrase_id = self.node_name_to_vertex_idx.get(phrase_key, None)
-
-                if phrase_id is not None:
-                    weighted_fact_score = fact_score
-
-                    if len(self.ent_node_to_chunk_ids.get(phrase_key, set())) > 0:
-                        weighted_fact_score /= len(self.ent_node_to_chunk_ids[phrase_key]) # “罕见实体更重要”的 IDF-ish 修正
-
-                    phrase_weights[phrase_id] += weighted_fact_score
-                    number_of_occurs[phrase_id] += 1
-
-                phrases_and_ids.add((phrase, phrase_id))
-
-        phrase_weights /= number_of_occurs
-
-        for phrase, phrase_id in phrases_and_ids:
-            if phrase not in phrase_scores:
-                phrase_scores[phrase] = []
-
-            phrase_scores[phrase].append(phrase_weights[phrase_id])
-
-        # calculate average fact score for each phrase
-        for phrase, scores in phrase_scores.items():
-            linking_score_map[phrase] = float(np.mean(scores))
-
-        if link_top_k:
-            phrase_weights, linking_score_map = self.get_top_k_weights(link_top_k,
-                                                                           phrase_weights,
-                                                                           linking_score_map)  # at this stage, the length of linking_scope_map is determined by link_top_k
-
-        #Get passage scores according to chosen dense retrieval model
-        dpr_sorted_doc_ids, dpr_sorted_doc_scores = self.dense_passage_retrieval(query)
-        normalized_dpr_sorted_scores = min_max_normalize(dpr_sorted_doc_scores)
-
-        for i, dpr_sorted_doc_id in enumerate(dpr_sorted_doc_ids.tolist()):
-            passage_node_key = self.passage_node_keys[dpr_sorted_doc_id]
-            passage_dpr_score = normalized_dpr_sorted_scores[i]
-            passage_node_id = self.node_name_to_vertex_idx[passage_node_key]
-            passage_weights[passage_node_id] = passage_dpr_score * passage_node_weight
-            passage_node_text = self.chunk_embedding_store.get_row(passage_node_key)["content"]
-            linking_score_map[passage_node_text] = passage_dpr_score * passage_node_weight
-
-        #Combining phrase and passage scores into one array for PPR
-        node_weights = phrase_weights + passage_weights
-
-        #Recording top 30 facts in linking_score_map
-        if len(linking_score_map) > 30:
-            linking_score_map = dict(sorted(linking_score_map.items(), key=lambda x: x[1], reverse=True)[:30])
-
-        assert sum(node_weights) > 0, f'No phrases found in the graph for the given facts: {top_k_facts}'
-
-        #Running PPR algorithm based on the passage and phrase weights previously assigned
-        ppr_start = time.time()
-        ppr_sorted_doc_ids, ppr_sorted_doc_scores = self.run_ppr(node_weights, damping=self.global_config.damping)
-        ppr_end = time.time()
-
-        self.ppr_time += (ppr_end - ppr_start)
-
-        assert len(ppr_sorted_doc_ids) == len(
-            self.passage_node_idxs), f"Doc prob length {len(ppr_sorted_doc_ids)} != corpus length {len(self.passage_node_idxs)}"
-
-        return ppr_sorted_doc_ids, ppr_sorted_doc_scores
+        """Compatibility entry point using shared fact seeds and the PPR adapter."""
+        fact_ids, weights, _ = build_fact_seeds(
+            top_k_facts, top_k_fact_indices, np.asarray(query_fact_scores).reshape(-1),
+            self.entity_node_keys, self.ent_node_to_chunk_ids or {}, link_top_k,
+        )
+        request = GraphSearchRequest(
+            query, query, 1, fact_ids, list(weights), weights, [],
+            retrieval_limit=len(self.passage_node_keys),
+        )
+        result = PPRGraphSearch(self, passage_node_weight).search(request)
+        if not result.ranked_passage_ids:
+            raise ValueError(result.fallback_reason or result.stop_reason)
+        positions = {key: i for i, key in enumerate(self.passage_node_keys)}
+        return np.array([positions[key] for key in result.ranked_passage_ids]), np.array(result.scores)
 
 
     def rerank_facts(
@@ -2478,7 +1970,8 @@ class SRgraphrag:
 
             real_candidate_fact_ids = [self.fact_node_keys[idx] for idx in candidate_fact_indices]
             fact_row_dict = self.fact_embedding_store.get_rows(real_candidate_fact_ids)
-            candidate_facts = [eval(fact_row_dict[_id]["content"]) for _id in real_candidate_fact_ids]
+            from ast import literal_eval
+            candidate_facts = [literal_eval(fact_row_dict[_id]["content"]) for _id in real_candidate_fact_ids]
 
             # ✅ rerank by LLM (instruction 透传)
             top_k_fact_indices, top_k_facts, reranker_dict = self.rerank_filter.rerank(
@@ -2529,7 +2022,10 @@ class SRgraphrag:
         """
 
         if damping is None: damping = 0.5 # for potential compatibility
-        reset_prob = np.where(np.isnan(reset_prob) | (reset_prob < 0), 0, reset_prob)
+        reset_prob = np.asarray(reset_prob, dtype=float)
+        reset_prob = np.where(~np.isfinite(reset_prob) | (reset_prob < 0), 0, reset_prob)
+        if reset_prob.shape != (self.graph.vcount(),) or reset_prob.sum() <= 0:
+            raise ValueError("PPR requires finite positive reset mass aligned with graph nodes")
         pagerank_scores = self.graph.personalized_pagerank(
             vertices=range(len(self.node_name_to_vertex_idx)),
             damping=damping,
@@ -2540,6 +2036,7 @@ class SRgraphrag:
         )
 
         doc_scores = np.array([pagerank_scores[idx] for idx in self.passage_node_idxs])
+        self._last_ppr_node_scores = {key: float(pagerank_scores[index]) for key, index in self.node_name_to_vertex_idx.items()}
         sorted_doc_ids = np.argsort(doc_scores)[::-1]
         sorted_doc_scores = doc_scores[sorted_doc_ids.tolist()]
 

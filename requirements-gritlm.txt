@@ -1,0 +1,3 @@
+# Optional GritLM embedding backend.
+-r requirements.txt
+gritlm
