@@ -160,7 +160,10 @@ def judge_answerability_and_bridge(
                             continue
                         return {"_error": f"HTTP {resp.status}", "_raw": text}
                     try:
-                        return json.loads(text)
+                        result = json.loads(text)
+                        if isinstance(result, dict):
+                            result["_request_attempts"] = attempt + 1
+                        return result
                     except Exception:
                         return {"_error": "JSON_DECODE_FAIL", "_raw": text}
             except (asyncio.TimeoutError, aiohttp.ClientError) as e:
@@ -315,6 +318,9 @@ def judge_answerability_and_bridge(
             "bridge_evidence_ids": bridge_ids,
             "bridge_analysis_zh": bridge_analysis_zh,
             "_judge_metadata": dict(metadata),
+            # Observability only: neither field participates in the gate decision.
+            "_usage": raw.get("usage") if isinstance(raw, dict) else None,
+            "_request_attempts": raw.get("_request_attempts") if isinstance(raw, dict) else None,
         }
         if isinstance(parsed, dict) and "_error" in parsed:
             out["_error"] = parsed.get("_error")
