@@ -26,6 +26,8 @@ The opt-in entry point is `scripts/run_thesis_experiments.py`. Production retrie
 
 Controls are injected only within the sequential experiment call using a scoped dispatcher patch. The static control uses the same graph tools and capacity validator; unknown choices fail closed and fall back to PPR. It is a bounded BFS control, not an official ToG reproduction. All failures remain in the denominator.
 
+The one-shot prompt explicitly separates `selectable_ids` from context-only IDs. Development replay exposed a protected passage outside PPR Top-30 being selected because the original instruction said only “listed IDs.” The v2 prompt removes that ambiguity without enlarging the candidate pool or silently accepting invalid selections. Validation failures retain their specific reason in the trace.
+
 The baseline Agent budget remains 8 rounds, 16 tool calls, 64 returned edges, 8 neighbors, 4 hops, 60 seconds, 2 retries; cumulative token cutoff is disabled. The 4/12-round variants retain all other limits, so termination reasons must be reported when another limit binds first. One-shot controls use one call with a 1024-token output cap; no prose/fenced JSON or invented IDs are silently repaired.
 
 ## Execution and recovery

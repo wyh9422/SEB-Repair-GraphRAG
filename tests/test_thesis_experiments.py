@@ -49,6 +49,21 @@ class ControlsTests(unittest.TestCase):
         self.assertNotIn("founded", str(masked["facts"]))
         self.assertEqual(masked["content"], "B founded C")
 
+    def test_selectable_ids_are_explicit_and_exclude_context_only_ids(self):
+        seen = []
+        def select(messages):
+            seen.append(messages)
+            return '{"ids":["protected-only"]}'
+        ids, _, event, error = choose_ids(select, {
+            "protected_passages": [{"id": "protected-only", "content": "Already retained"}],
+            "selectable_ids": ["must-not-override-allowlist"],
+        }, ["candidate"], field="ids", maximum=5)
+        self.assertEqual(json.loads(seen[0][1]["content"])["selectable_ids"], ["candidate"])
+        self.assertIn("already retained", seen[0][0]["content"])
+        self.assertEqual(ids, [])
+        self.assertEqual(error, "ValueError")
+        self.assertEqual(event["selection_error"], "invalid_selection_ids")
+
     def test_masked_adapter_preserves_limits_and_opaque_ids(self):
         received = []
         wrapped = PredicateMaskedLLM(lambda messages: received.append(messages) or "ok")
